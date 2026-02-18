@@ -1,10 +1,13 @@
 # app.py
-import io
-import math
 import os
+import io
+import html
+import math
+import time
+import hashlib
 import tempfile
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import cv2
 import numpy as np
@@ -12,24 +15,96 @@ import pandas as pd
 import streamlit as st
 from PIL import Image
 
-from sklearn.cluster import AgglomerativeClustering
-from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import PCA
-
 from skimage.metrics import structural_similarity as ssim
 from skimage.feature import local_binary_pattern
+
+# Clustering (optional section in app; used for "cluster number" tooltips)
+try:
+    from sklearn.cluster import AgglomerativeClustering
+    from sklearn.preprocessing import StandardScaler
+    SKLEARN_OK = True
+except Exception:
+    SKLEARN_OK = False
 
 # ----------------------------
 # Config
 # ----------------------------
-st.set_page_config(page_title="Resonance Finder", layout="wide")
+st.set_page_config(page_title="Multi-Video Frame Similarity", layout="wide")
 
 LBP_P = 16
 LBP_R = 2
 LBP_METHOD = "uniform"
 
 # ----------------------------
-# Helpers: image + descriptors
+# Labeling helpers (Option 3: hover-only metadata)
+# ----------------------------
+def format_time(seconds: float) -> str:
+    m = int(seconds // 60)
+    s = int(seconds % 60)
+    return f"{m:02d}:{s:02d}"
+
+def video_letter_name(video_index: int) -> str:
+    return f"Video {chr(65 + int(video_index))}"
+
+def build_hover_tooltip(
+    r,
+    similarity_score: Optional[float] = None,
+    cluster_id: Optional[int] = None,
+) -> str:
+    parts = []
+    parts.append(f"Frame ID: {r.frame_id}")
+    parts.append(f"Exact time: {r.t_sec:.6f} seconds")
+    parts.append(f"Frame index: {r.frame_index}")
+    parts.append(f"Entropy: {r.entropy:.6f}")
+    parts.append(f"Edge density: {r.edge:.6f}")
+    parts.append(f"Brightness: {r.brightness:.2f}")
+
+    if similarity_score is not None:
+        parts.append(f"Similarity score: {float(similarity_score):.6f}")
+
+    if cluster_id is not None:
+        parts.append(f"Cluster: {int(cluster_id)}")
+
+    # You can add more fields here if you like (e.g., video filename)
+    parts.append(f"Source file: {r.video_name}")
+
+    return "\n".join(parts)
+
+def render_frame_label(
+    r,
+    similarity_score: Optional[float] = None,
+    cluster_id: Optional[int] = None,
+) -> None:
+    """
+    Visible:  Video A · 00:12
+    Hover:    frame ID, exact timestamp, entropy, similarity score, cluster number, etc.
+    """
+    visible = f"{video_letter_name(r.video_index)} · {format_time(r.t_sec)}"
+    tooltip = build_hover_tooltip(r, similarity_score=similarity_score, cluster_id=cluster_id)
+
+    visible_e = html.escape(visible)
+    tooltip_e = html.escape(tooltip)
+
+    st.markdown(
+        f"""
+        <div title="{tooltip_e}"
+             style="
+                font-size:13px;
+                margin-top:2px;
+                white-space:nowrap;
+                overflow:hidden;
+                text-overflow:ellipsis;
+                cursor:default;
+                opacity:0.92;
+             ">
+          {visible_e}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+# ----------------------------
+# Image + descriptor helpers
 # ----------------------------
 def _to_gray(img_bgr: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
@@ -42,14 +117,7 @@ def _resize_keep_aspect(img: np.ndarray, max_side: int) -> np.ndarray:
     nh, nw = int(round(h * scale)), int(round(w * scale))
     return cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA)
 
-def _safe_float(x) -> float:
-    try:
-        return float(x)
-    except Exception:
-        return 0.0
-
 def shannon_entropy_gray(gray: np.ndarray) -> float:
-    # grayscale histogram entropy (base-2) in [0, 8] roughly for 8-bit
     hist = cv2.calcHist([gray], [0], None, [256], [0, 256]).ravel()
     p = hist / (hist.sum() + 1e-12)
     p = p[p > 0]
@@ -63,7 +131,6 @@ def brightness_mean(gray: np.ndarray) -> float:
     return float(gray.mean())  # 0..255
 
 def color_hist_bgr(img_bgr: np.ndarray, bins: int = 32) -> np.ndarray:
-    # normalized 3-channel hist flattened
     hist = []
     for ch in range(3):
         h = cv2.calcHist([img_bgr], [ch], None, [bins], [0, 256]).ravel()
@@ -80,7 +147,6 @@ def hue_hist(img_bgr: np.ndarray, bins: int = 36) -> np.ndarray:
 
 def lbp_hist(gray: np.ndarray) -> np.ndarray:
     lbp = local_binary_pattern(gray, P=LBP_P, R=LBP_R, method=LBP_METHOD)
-    # For uniform LBP, number of patterns is P+2
     n_bins = LBP_P + 2
     hist, _ = np.histogram(lbp.ravel(), bins=n_bins, range=(0, n_bins), density=False)
     hist = hist.astype(np.float32)
@@ -88,7 +154,6 @@ def lbp_hist(gray: np.ndarray) -> np.ndarray:
     return hist
 
 def corr_sim(a: np.ndarray, b: np.ndarray) -> float:
-    # cosine similarity in [0,1] after mapping from [-1,1]
     a = a.astype(np.float32).ravel()
     b = b.astype(np.float32).ravel()
     na = np.linalg.norm(a) + 1e-12
@@ -98,16 +163,15 @@ def corr_sim(a: np.ndarray, b: np.ndarray) -> float:
     return (cos + 1.0) / 2.0
 
 def hist_corr_sim(a: np.ndarray, b: np.ndarray) -> float:
-    # Pearson corr-ish using OpenCV compareHist correlation on 1D
-    a = a.astype(np.float32).ravel()
-    b = b.astype(np.float32).ravel()
-    # compareHist expects shape (N,1) or (1,N)
-    a2 = a.reshape(-1, 1)
-    b2 = b.reshape(-1, 1)
-    c = float(cv2.compareHist(a2, b2, cv2.HISTCMP_CORREL))
+    a = a.astype(np.float32).ravel().reshape(-1, 1)
+    b = b.astype(np.float32).ravel().reshape(-1, 1)
+    c = float(cv2.compareHist(a, b, cv2.HISTCMP_CORREL))
     c = max(-1.0, min(1.0, c))
     return (c + 1.0) / 2.0
 
+# ----------------------------
+# Data structure
+# ----------------------------
 @dataclass
 class FrameRecord:
     frame_id: str
@@ -126,6 +190,9 @@ class FrameRecord:
     texture_hist: np.ndarray
     brightness: float
 
+# ----------------------------
+# Similarity computation
+# ----------------------------
 def compute_pair_similarity(
     A: FrameRecord,
     B: FrameRecord,
@@ -135,28 +202,21 @@ def compute_pair_similarity(
     try:
         s = float(ssim(A.gray_small, B.gray_small, data_range=255))
         s = max(-1.0, min(1.0, s))
-        ssim_sim = (s + 1.0) / 2.0  # map to [0,1]
+        ssim_sim = (s + 1.0) / 2.0
     except Exception:
         ssim_sim = 0.0
 
-    # Color histogram similarity
     color_sim = hist_corr_sim(A.color_hist, B.color_hist)
 
-    # Entropy similarity
-    # entropy roughly 0..8, similarity = 1 - normalized absolute difference
     e_diff = abs(A.entropy - B.entropy)
     ent_sim = 1.0 - min(1.0, e_diff / 8.0)
 
-    # Edge complexity similarity (edge density 0..1)
-    edge_sim = 1.0 - min(1.0, abs(A.edge - B.edge) / 1.0)
+    edge_sim = 1.0 - min(1.0, abs(A.edge - B.edge))
 
-    # Texture correlation (LBP hist cosine sim)
     tex_sim = corr_sim(A.texture_hist, B.texture_hist)
 
-    # Brightness similarity (0..255)
     bri_sim = 1.0 - min(1.0, abs(A.brightness - B.brightness) / 255.0)
 
-    # Hue distribution similarity
     hue_sim = hist_corr_sim(A.hue_hist, B.hue_hist)
 
     comps = {
@@ -169,98 +229,13 @@ def compute_pair_similarity(
         "hue_distribution": hue_sim,
     }
 
-    # weighted average
-    wsum = sum(max(0.0, _safe_float(weights.get(k, 0.0))) for k in comps.keys()) + 1e-12
-    score = sum(comps[k] * max(0.0, _safe_float(weights.get(k, 0.0))) for k in comps.keys()) / wsum
+    wsum = sum(max(0.0, float(weights.get(k, 0.0))) for k in comps.keys()) + 1e-12
+    score = sum(comps[k] * max(0.0, float(weights.get(k, 0.0))) for k in comps.keys()) / wsum
     return float(score), comps
-
-
-def build_feature_matrix(records):
-    """
-    Converts FrameRecord descriptors into a single feature matrix for clustering.
-    """
-
-    features = []
-
-    for r in records:
-        vec = np.concatenate([
-            r.color_hist,                 # color distribution
-            r.hue_hist,                   # hue distribution
-            r.texture_hist,               # texture
-            np.array([
-                r.entropy / 8.0,
-                r.edge,
-                r.brightness / 255.0,
-            ], dtype=np.float32)
-        ])
-
-        features.append(vec)
-
-    X = np.vstack(features)
-
-    # normalize
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-
-    return X_scaled
-
-
-def cluster_frames(records, distance_threshold=5.0):
-    """
-    Clusters frames into visual scenes across ALL videos.
-    Uses hierarchical clustering so number of clusters is automatically determined.
-    """
-
-    X = build_feature_matrix(records)
-
-    clustering = AgglomerativeClustering(
-        n_clusters=None,
-        distance_threshold=distance_threshold,
-        linkage="ward"
-    )
-
-    labels = clustering.fit_predict(X)
-
-    return labels
-
-
-def compute_cluster_representatives(records, labels):
-    """
-    Returns one representative frame per cluster (closest to centroid).
-    """
-
-    reps = {}
-
-    X = build_feature_matrix(records)
-
-    for cluster_id in np.unique(labels):
-
-        indices = np.where(labels == cluster_id)[0]
-        cluster_vectors = X[indices]
-
-        centroid = cluster_vectors.mean(axis=0)
-
-        distances = np.linalg.norm(cluster_vectors - centroid, axis=1)
-
-        best_index = indices[np.argmin(distances)]
-
-        reps[cluster_id] = records[best_index]
-
-    return reps
-
 
 # ----------------------------
 # Video -> frames
 # ----------------------------
-def write_uploaded_to_temp(uploaded_file) -> str:
-    # store to temp file so cv2 can read it
-    suffix = os.path.splitext(uploaded_file.name)[1] or ".mp4"
-    fd, path = tempfile.mkstemp(suffix=suffix)
-    os.close(fd)
-    with open(path, "wb") as f:
-        f.write(uploaded_file.getbuffer())
-    return path
-
 def extract_frames(
     video_path: str,
     video_name: str,
@@ -287,11 +262,9 @@ def extract_frames(
         step = max(1, int(round(interval_value)))
 
     frames: List[FrameRecord] = []
-
     frame_idx = 0
     grabbed = 0
 
-    # If total_frames unknown, just iterate until failure.
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -309,9 +282,9 @@ def extract_frames(
             thumb_path = os.path.join(thumbs_dir, f"{frame_id}.jpg")
             thumb_img.save(thumb_path, quality=90)
 
-            # analysis frame (smaller)
+            # analysis frame
             analysis_bgr = _resize_keep_aspect(frame, analysis_max_side)
-            gray = _to_gray(analysis_bgr)
+            gray = _to_gray(analysis_bgr).astype(np.uint8)
 
             rec = FrameRecord(
                 frame_id=frame_id,
@@ -320,7 +293,7 @@ def extract_frames(
                 t_sec=float(t_sec),
                 frame_index=int(frame_idx),
                 thumb_path=thumb_path,
-                gray_small=gray.astype(np.uint8),
+                gray_small=gray,
                 color_hist=color_hist_bgr(analysis_bgr, bins=32),
                 hue_hist=hue_hist(analysis_bgr, bins=36),
                 entropy=shannon_entropy_gray(gray),
@@ -334,108 +307,55 @@ def extract_frames(
                 break
 
         frame_idx += 1
-
-        # guard for certain codecs returning nonsense CAP_PROP_FRAME_COUNT
         if total_frames and frame_idx >= total_frames:
             break
 
     cap.release()
     return frames
 
-@st.cache_data(show_spinner=False)
-def process_videos_cached(
+def write_bytes_to_temp(bts: bytes, name: str) -> str:
+    suffix = os.path.splitext(name)[1] or ".mp4"
+    fd, path = tempfile.mkstemp(suffix=suffix)
+    os.close(fd)
+    with open(path, "wb") as f:
+        f.write(bts)
+    return path
+
+def build_cache_key(
     file_bytes_and_names: List[Tuple[bytes, str]],
     mode: str,
     interval_value: float,
     max_frames: int,
     thumb_max_side: int,
     analysis_max_side: int,
-) -> Tuple[List[Dict], str]:
-    """
-    Returns:
-      - list of serializable frame rows with descriptors saved separately in memory via session (we reconstruct records later)
-      - thumbs_dir used
-    """
+) -> str:
+    h = hashlib.sha256()
+    h.update(mode.encode("utf-8"))
+    h.update(str(interval_value).encode("utf-8"))
+    h.update(str(max_frames).encode("utf-8"))
+    h.update(str(thumb_max_side).encode("utf-8"))
+    h.update(str(analysis_max_side).encode("utf-8"))
+    # include file content + names
+    for bts, name in file_bytes_and_names:
+        h.update(name.encode("utf-8"))
+        h.update(hashlib.sha256(bts).digest())
+    return h.hexdigest()
+
+def process_videos(
+    file_bytes_and_names: List[Tuple[bytes, str]],
+    mode: str,
+    interval_value: float,
+    max_frames: int,
+    thumb_max_side: int,
+    analysis_max_side: int,
+) -> Tuple[List[FrameRecord], str]:
     thumbs_dir = tempfile.mkdtemp(prefix="thumbs_")
-
-    temp_paths = []
-    try:
-        all_records: List[FrameRecord] = []
-        for i, (bts, name) in enumerate(file_bytes_and_names):
-            # write bytes to temp path
-            suffix = os.path.splitext(name)[1] or ".mp4"
-            fd, path = tempfile.mkstemp(suffix=suffix)
-            os.close(fd)
-            with open(path, "wb") as f:
-                f.write(bts)
-            temp_paths.append(path)
-
-            recs = extract_frames(
-                video_path=path,
-                video_name=name,
-                video_index=i,
-                mode=mode,
-                interval_value=interval_value,
-                max_frames=max_frames,
-                thumb_max_side=thumb_max_side,
-                analysis_max_side=analysis_max_side,
-                thumbs_dir=thumbs_dir,
-            )
-            all_records.extend(recs)
-
-        # Make a minimal serializable representation; actual arrays will be stored in session_state separately.
-        rows = []
-        for r in all_records:
-            rows.append(
-                dict(
-                    frame_id=r.frame_id,
-                    video_name=r.video_name,
-                    video_index=r.video_index,
-                    t_sec=r.t_sec,
-                    frame_index=r.frame_index,
-                    thumb_path=r.thumb_path,
-                    # descriptors: serialize scalars only
-                    entropy=r.entropy,
-                    edge=r.edge,
-                    brightness=r.brightness,
-                )
-            )
-
-        # NOTE: we can’t reliably cache numpy arrays in all Streamlit environments with great performance,
-        # so we’ll reconstruct full FrameRecord objects in session_state right after this cache call.
-        return rows, thumbs_dir
-    finally:
-        for p in temp_paths:
-            try:
-                os.remove(p)
-            except Exception:
-                pass
-
-def rebuild_records_from_rows(
-    rows: List[Dict],
-    thumbs_dir: str,
-    file_bytes_and_names: List[Tuple[bytes, str]],
-    mode: str,
-    interval_value: float,
-    max_frames: int,
-    thumb_max_side: int,
-    analysis_max_side: int,
-) -> List[FrameRecord]:
-    """
-    Re-run extraction to rebuild numpy descriptors in-memory.
-    (We keep caching for the expensive control flow & thumbs, but ensure descriptors are correct in-session.)
-    """
-    # We’ll extract again, but this time we can reuse thumbs_dir by pointing extraction there.
-    # To avoid duplicating thumbnails, extraction will overwrite same names (same frame_id) harmlessly.
     temp_paths = []
     all_records: List[FrameRecord] = []
+
     try:
         for i, (bts, name) in enumerate(file_bytes_and_names):
-            suffix = os.path.splitext(name)[1] or ".mp4"
-            fd, path = tempfile.mkstemp(suffix=suffix)
-            os.close(fd)
-            with open(path, "wb") as f:
-                f.write(bts)
+            path = write_bytes_to_temp(bts, name)
             temp_paths.append(path)
 
             recs = extract_frames(
@@ -450,7 +370,8 @@ def rebuild_records_from_rows(
                 thumbs_dir=thumbs_dir,
             )
             all_records.extend(recs)
-        return all_records
+
+        return all_records, thumbs_dir
     finally:
         for p in temp_paths:
             try:
@@ -458,46 +379,44 @@ def rebuild_records_from_rows(
             except Exception:
                 pass
 
-st.divider()
-st.subheader("Scene clustering across all videos")
-
-cluster_threshold = st.slider(
-    "Cluster sensitivity (lower = more clusters, higher = fewer clusters)",
-    min_value=1.0,
-    max_value=15.0,
-    value=5.0,
-    step=0.5,
-)
-
-if st.button("Cluster frames into scenes"):
-
-    with st.spinner("Clustering frames..."):
-
-        labels = cluster_frames(records, distance_threshold=cluster_threshold)
-
-        representatives = compute_cluster_representatives(records, labels)
-
-        n_clusters = len(representatives)
-
-        st.success(f"{n_clusters} visual scenes detected")
-
-        # display clusters
-        for cluster_id in sorted(representatives.keys()):
-
-            st.markdown(f"### Scene {cluster_id}")
-
-            cluster_records = [
-                r for i, r in enumerate(records)
-                if labels[i] == cluster_id
+# ----------------------------
+# Clustering (scene clustering across all videos)
+# ----------------------------
+def build_feature_matrix_for_clustering(records: List[FrameRecord]) -> np.ndarray:
+    # Use descriptors that travel well across videos
+    feats = []
+    for r in records:
+        vec = np.concatenate(
+            [
+                r.color_hist,
+                r.hue_hist,
+                r.texture_hist,
+                np.array(
+                    [
+                        r.entropy / 8.0,
+                        r.edge,
+                        r.brightness / 255.0,
+                    ],
+                    dtype=np.float32,
+                ),
             ]
+        )
+        feats.append(vec)
+    X = np.vstack(feats).astype(np.float32)
 
-            cols = st.columns(6)
+    scaler = StandardScaler()
+    Xs = scaler.fit_transform(X)
+    return Xs
 
-            for i, r in enumerate(cluster_records[:18]):  # limit per cluster
-                with cols[i % 6]:
-                    st.image(r.thumb_path)
-                    st.caption(f"{r.video_name} @ {r.t_sec:.2f}s")
-
+def cluster_frames(records: List[FrameRecord], distance_threshold: float) -> np.ndarray:
+    X = build_feature_matrix_for_clustering(records)
+    clustering = AgglomerativeClustering(
+        n_clusters=None,
+        distance_threshold=float(distance_threshold),
+        linkage="ward",
+    )
+    labels = clustering.fit_predict(X)
+    return labels
 
 # ----------------------------
 # UI
@@ -507,7 +426,7 @@ st.title("Multi-Video Frame Similarity Analyzer")
 with st.sidebar:
     st.header("1) Upload videos")
     uploads = st.file_uploader(
-        "Upload 3 videos (or more). Common formats: mp4, mov, m4v.",
+        "Upload videos (3 or more recommended).",
         type=["mp4", "mov", "m4v", "avi", "mkv", "webm"],
         accept_multiple_files=True,
     )
@@ -539,7 +458,6 @@ with st.sidebar:
     st.header("5) Retrieval")
     top_k = st.slider("Top-K matches to show", min_value=3, max_value=50, value=12, step=1)
 
-# Main
 if not uploads:
     st.info("Upload your videos in the sidebar to begin.")
     st.stop()
@@ -548,33 +466,40 @@ if len(uploads) < 2:
     st.warning("Upload at least 2 videos to enable cross-video comparison.")
     st.stop()
 
-# Turn uploads into stable bytes for caching
 file_bytes_and_names = [(u.getbuffer().tobytes(), u.name) for u in uploads]
 
-with st.spinner("Extracting frames and computing descriptors..."):
-    rows, thumbs_dir = process_videos_cached(
-        file_bytes_and_names=file_bytes_and_names,
-        mode=mode,
-        interval_value=float(interval_value),
-        max_frames=int(max_frames),
-        thumb_max_side=int(thumb_max_side),
-        analysis_max_side=int(analysis_max_side),
-    )
-    # Rebuild full in-memory records for similarity computations
-    records = rebuild_records_from_rows(
-        rows=rows,
-        thumbs_dir=thumbs_dir,
-        file_bytes_and_names=file_bytes_and_names,
-        mode=mode,
-        interval_value=float(interval_value),
-        max_frames=int(max_frames),
-        thumb_max_side=int(thumb_max_side),
-        analysis_max_side=int(analysis_max_side),
-    )
+cache_key = build_cache_key(
+    file_bytes_and_names=file_bytes_and_names,
+    mode=mode,
+    interval_value=float(interval_value),
+    max_frames=int(max_frames),
+    thumb_max_side=int(thumb_max_side),
+    analysis_max_side=int(analysis_max_side),
+)
+
+if "cache_key" not in st.session_state or st.session_state.cache_key != cache_key:
+    with st.spinner("Extracting frames and computing descriptors..."):
+        records, thumbs_dir = process_videos(
+            file_bytes_and_names=file_bytes_and_names,
+            mode=mode,
+            interval_value=float(interval_value),
+            max_frames=int(max_frames),
+            thumb_max_side=int(thumb_max_side),
+            analysis_max_side=int(analysis_max_side),
+        )
+    st.session_state.cache_key = cache_key
+    st.session_state.records = records
+    st.session_state.thumbs_dir = thumbs_dir
+    st.session_state.cluster_labels = None  # reset clustering on new extraction
+else:
+    records = st.session_state.records
+    thumbs_dir = st.session_state.thumbs_dir
 
 if not records:
     st.error("No frames were extracted. Try a smaller interval or a higher max-frames-per-video.")
     st.stop()
+
+rec_by_id: Dict[str, FrameRecord] = {r.frame_id: r for r in records}
 
 df = pd.DataFrame(
     [
@@ -593,18 +518,16 @@ df = pd.DataFrame(
     ]
 )
 
-# Build quick lookup
-rec_by_id: Dict[str, FrameRecord] = {r.frame_id: r for r in records}
-
 # ---------------------------------
-# Section: Browse frames
+# Extracted frames browser
 # ---------------------------------
 st.subheader("Extracted frames")
+
 c1, c2, c3 = st.columns([1.2, 1.2, 2.6])
 
 with c1:
     video_filter = st.multiselect(
-        "Filter by video",
+        "Filter by source file",
         options=sorted(df["video"].unique().tolist()),
         default=sorted(df["video"].unique().tolist()),
     )
@@ -615,23 +538,30 @@ with c2:
     st.metric("Frames extracted (filtered)", len(df_f))
 
 with c3:
-    st.caption("Tip: pick a query frame below, then retrieve closest matches across *all* uploaded videos.")
+    st.caption("Tip: Pick a query frame below, then retrieve closest matches across *all* uploaded videos.")
 
-# A grid of thumbnails (limited for UI sanity)
+# thumbnail grid (limited)
 max_grid = 60
 grid_df = df_f.head(max_grid)
+
+# If clustering exists, map frame_id -> cluster label
+cluster_map = None
+if st.session_state.get("cluster_labels") is not None:
+    cluster_map = {records[i].frame_id: int(st.session_state.cluster_labels[i]) for i in range(len(records))}
 
 cols = st.columns(6)
 for i, row in enumerate(grid_df.itertuples(index=False)):
     col = cols[i % 6]
     with col:
         st.image(row.thumb_path, use_container_width=True)
-        st.caption(f"{row.video}\n t={row.time_sec}s\n id={row.frame_id}")
+        r = rec_by_id[row.frame_id]
+        cid = cluster_map.get(r.frame_id) if cluster_map else None
+        render_frame_label(r, cluster_id=cid)
 
 st.divider()
 
 # ---------------------------------
-# Section: Query + retrieve
+# Similarity search across videos
 # ---------------------------------
 st.subheader("Similarity search across all videos")
 
@@ -641,17 +571,17 @@ with left:
     query_frame_id = st.selectbox(
         "Choose a query frame",
         options=df_f["frame_id"].tolist(),
-        format_func=lambda fid: f"{fid} — {rec_by_id[fid].video_name} @ {rec_by_id[fid].t_sec:.2f}s",
+        format_func=lambda fid: f"{video_letter_name(rec_by_id[fid].video_index)} · {format_time(rec_by_id[fid].t_sec)}",
     )
     query = rec_by_id[query_frame_id]
     st.image(query.thumb_path, use_container_width=True)
-    st.caption(f"Query: {query.video_name} @ {query.t_sec:.2f}s (frame {query.frame_index})")
+    cid = cluster_map.get(query.frame_id) if cluster_map else None
+    render_frame_label(query, cluster_id=cid)
 
-    exclude_same_frame = st.checkbox("Exclude the exact same frame_id from results", value=True)
+    exclude_same_frame = st.checkbox("Exclude the exact same frame from results", value=True)
     exclude_same_video = st.checkbox("Exclude frames from the same video", value=False)
 
 with right:
-    # Compute similarities
     sims = []
     for r in records:
         if exclude_same_frame and r.frame_id == query.frame_id:
@@ -677,17 +607,15 @@ with right:
         st.warning("No matches found under the current filters.")
     else:
         st.write("Top matches")
-        # Show top matches as a gallery
+
         gallery_cols = st.columns(4)
         for i, row in enumerate(sims_df.itertuples(index=False)):
             with gallery_cols[i % 4]:
                 st.image(row.thumb_path, use_container_width=True)
-                st.caption(
-                    f"Score: {row.score:.3f}\n"
-                    f"{row.video}\n"
-                    f"t={row.time_sec:.2f}s\n"
-                    f"id={row.frame_id}"
-                )
+                rr = rec_by_id[row.frame_id]
+                cid2 = cluster_map.get(rr.frame_id) if cluster_map else None
+                # Visible stays clean; score & cluster stay on hover
+                render_frame_label(rr, similarity_score=row.score, cluster_id=cid2)
 
         with st.expander("Show match table (with metric breakdown)"):
             show_cols = [
@@ -709,21 +637,72 @@ with right:
 st.divider()
 
 # ---------------------------------
-# Section: Cross-video summary
+# Scene clustering across all videos (for cluster numbers in hover)
+# ---------------------------------
+st.subheader("Scene clustering across all videos")
+
+if not SKLEARN_OK:
+    st.warning("Clustering requires scikit-learn. Add `scikit-learn` to requirements.txt to enable this section.")
+else:
+    st.caption("This groups frames into visually similar “scenes” across *all* uploaded videos.")
+
+    cluster_threshold = st.slider(
+        "Cluster sensitivity (lower = more clusters, higher = fewer clusters)",
+        min_value=1.0,
+        max_value=15.0,
+        value=5.0,
+        step=0.5,
+    )
+
+    cc1, cc2 = st.columns([1, 2])
+    with cc1:
+        do_cluster = st.button("Cluster frames into scenes")
+
+    with cc2:
+        if st.session_state.get("cluster_labels") is not None:
+            n_clusters = len(set(map(int, st.session_state.cluster_labels.tolist())))
+            st.info(f"Current clustering: {n_clusters} clusters (hover labels now show cluster numbers).")
+        else:
+            st.info("No clustering computed yet.")
+
+    if do_cluster:
+        with st.spinner("Clustering frames..."):
+            labels = cluster_frames(records, distance_threshold=float(cluster_threshold))
+            st.session_state.cluster_labels = labels
+
+        # refresh cluster_map
+        cluster_map = {records[i].frame_id: int(labels[i]) for i in range(len(records))}
+        n_clusters = len(set(cluster_map.values()))
+        st.success(f"Detected {n_clusters} clusters.")
+
+        # Show a compact preview: one row per cluster (first few frames)
+        st.caption("Cluster preview (first ~18 frames per cluster shown)")
+        for cluster_id in sorted(set(cluster_map.values())):
+            st.markdown(f"### Cluster {cluster_id}")
+            cluster_records = [r for r in records if cluster_map.get(r.frame_id) == cluster_id]
+            cluster_records = sorted(cluster_records, key=lambda x: (x.video_index, x.t_sec))[:18]
+
+            cols = st.columns(6)
+            for i, r in enumerate(cluster_records):
+                with cols[i % 6]:
+                    st.image(r.thumb_path, use_container_width=True)
+                    render_frame_label(r, cluster_id=cluster_id)
+
+st.divider()
+
+# ---------------------------------
+# Cross-video similarity summary (optional)
 # ---------------------------------
 st.subheader("Cross-video similarity summary (optional)")
-
 st.caption(
-    "This computes a rough 'how similar are these videos' score by taking, for each frame in Video A, "
-    "the best match score found in Video B, then averaging those best-match scores."
+    "Rough video-to-video similarity: for each frame in Video A, take its best match in Video B, then average."
 )
 
 do_summary = st.checkbox("Compute cross-video similarity matrix", value=False)
 
 if do_summary:
-    with st.spinner("Computing cross-video similarity matrix... (can be slow with many frames)"):
+    with st.spinner("Computing cross-video similarity matrix... (can be slow)"):
         videos = sorted(df["video"].unique().tolist())
-        vid_to_idx = {v: i for i, v in enumerate(videos)}
         by_video: Dict[str, List[FrameRecord]] = {v: [] for v in videos}
         for r in records:
             by_video[r.video_name].append(r)
@@ -738,7 +717,7 @@ if do_summary:
                     mat[i, j] = 1.0
                     continue
                 B = by_video[vb]
-                # Average of best matches A->B
+
                 bests = []
                 for a in A:
                     best = 0.0
@@ -747,13 +726,14 @@ if do_summary:
                         if score > best:
                             best = score
                     bests.append(best)
+
                 mat[i, j] = float(np.mean(bests)) if bests else 0.0
 
         mat_df = pd.DataFrame(mat, index=videos, columns=videos)
         st.dataframe(mat_df.style.format("{:.3f}"), use_container_width=True)
 
 # ---------------------------------
-# Notes
+# Metric definitions
 # ---------------------------------
 with st.expander("Metric definitions (what the app is computing)"):
     st.markdown(
@@ -765,8 +745,5 @@ with st.expander("Metric definitions (what the app is computing)"):
 - **Texture correlation:** compares LBP texture histograms (cosine similarity).
 - **Brightness similarity:** compares mean grayscale brightness.
 - **Hue distribution:** correlation between hue histograms in HSV space.
-
-**Tip:** If your videos are long, start with a larger interval (e.g., every 2–5 seconds) and a max frames per video (e.g., 150–300),
-then narrow down once you see where good matches cluster.
         """
     )
