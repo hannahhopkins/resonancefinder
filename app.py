@@ -12,6 +12,10 @@ import pandas as pd
 import streamlit as st
 from PIL import Image
 
+from sklearn.cluster import AgglomerativeClustering
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+
 from skimage.metrics import structural_similarity as ssim
 from skimage.feature import local_binary_pattern
 
@@ -169,6 +173,81 @@ def compute_pair_similarity(
     wsum = sum(max(0.0, _safe_float(weights.get(k, 0.0))) for k in comps.keys()) + 1e-12
     score = sum(comps[k] * max(0.0, _safe_float(weights.get(k, 0.0))) for k in comps.keys()) / wsum
     return float(score), comps
+
+
+def build_feature_matrix(records):
+    """
+    Converts FrameRecord descriptors into a single feature matrix for clustering.
+    """
+
+    features = []
+
+    for r in records:
+        vec = np.concatenate([
+            r.color_hist,                 # color distribution
+            r.hue_hist,                   # hue distribution
+            r.texture_hist,               # texture
+            np.array([
+                r.entropy / 8.0,
+                r.edge,
+                r.brightness / 255.0,
+            ], dtype=np.float32)
+        ])
+
+        features.append(vec)
+
+    X = np.vstack(features)
+
+    # normalize
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    return X_scaled
+
+
+def cluster_frames(records, distance_threshold=5.0):
+    """
+    Clusters frames into visual scenes across ALL videos.
+    Uses hierarchical clustering so number of clusters is automatically determined.
+    """
+
+    X = build_feature_matrix(records)
+
+    clustering = AgglomerativeClustering(
+        n_clusters=None,
+        distance_threshold=distance_threshold,
+        linkage="ward"
+    )
+
+    labels = clustering.fit_predict(X)
+
+    return labels
+
+
+def compute_cluster_representatives(records, labels):
+    """
+    Returns one representative frame per cluster (closest to centroid).
+    """
+
+    reps = {}
+
+    X = build_feature_matrix(records)
+
+    for cluster_id in np.unique(labels):
+
+        indices = np.where(labels == cluster_id)[0]
+        cluster_vectors = X[indices]
+
+        centroid = cluster_vectors.mean(axis=0)
+
+        distances = np.linalg.norm(cluster_vectors - centroid, axis=1)
+
+        best_index = indices[np.argmin(distances)]
+
+        reps[cluster_id] = records[best_index]
+
+    return reps
+
 
 # ----------------------------
 # Video -> frames
@@ -378,6 +457,47 @@ def rebuild_records_from_rows(
                 os.remove(p)
             except Exception:
                 pass
+
+st.divider()
+st.subheader("Scene clustering across all videos")
+
+cluster_threshold = st.slider(
+    "Cluster sensitivity (lower = more clusters, higher = fewer clusters)",
+    min_value=1.0,
+    max_value=15.0,
+    value=5.0,
+    step=0.5,
+)
+
+if st.button("Cluster frames into scenes"):
+
+    with st.spinner("Clustering frames..."):
+
+        labels = cluster_frames(records, distance_threshold=cluster_threshold)
+
+        representatives = compute_cluster_representatives(records, labels)
+
+        n_clusters = len(representatives)
+
+        st.success(f"{n_clusters} visual scenes detected")
+
+        # display clusters
+        for cluster_id in sorted(representatives.keys()):
+
+            st.markdown(f"### Scene {cluster_id}")
+
+            cluster_records = [
+                r for i, r in enumerate(records)
+                if labels[i] == cluster_id
+            ]
+
+            cols = st.columns(6)
+
+            for i, r in enumerate(cluster_records[:18]):  # limit per cluster
+                with cols[i % 6]:
+                    st.image(r.thumb_path)
+                    st.caption(f"{r.video_name} @ {r.t_sec:.2f}s")
+
 
 # ----------------------------
 # UI
