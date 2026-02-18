@@ -5,3 +5,6 @@ pandas
 pillow
 scikit-image
 scikit-learn
+yt-dlp
+torch
+open_clip_torch
