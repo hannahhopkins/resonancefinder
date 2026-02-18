@@ -22,7 +22,7 @@ from skimage.feature import local_binary_pattern
 # ----------------------------
 # Config
 # ----------------------------
-st.set_page_config(page_title="Multi-Video Frame Similarity", layout="wide")
+st.set_page_config(page_title="Resonance Finder", layout="wide")
 
 LBP_P = 16
 LBP_R = 2
