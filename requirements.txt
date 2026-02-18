@@ -8,3 +8,4 @@ scikit-learn
 yt-dlp
 torch
 open_clip_torch
+yt-dlp 
