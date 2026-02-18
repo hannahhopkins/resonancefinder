@@ -1,11 +1,13 @@
 # app.py
-# Multi-Video (or Single-Video) Frame Similarity + Optional YouTube URL input + Optional CLIP similarity
+# Frame Similarity Analyzer
+# - Mix uploads + YouTube URLs in the same session (any combination)
+# - Works with 1 video (single-video scope) or many (cross-video optional)
+# - Hover-only metadata labels (Visible: "Video A · 00:12")
+# - Optional: CLIP similarity, Clustering
 #
-# Visible labels: "Video A · 00:12"
-# Hover: frame ID, exact timestamp, entropy, similarity score, cluster number, etc.
+# NOTE: YouTube downloads are best-effort and may fail for restricted videos.
 
 import os
-import io
 import html
 import math
 import time
@@ -39,7 +41,6 @@ except Exception:
     SKLEARN_OK = False
 
 # Optional: CLIP
-# Uses open_clip (recommended for easy local embeddings)
 try:
     import torch
     import open_clip
@@ -51,11 +52,12 @@ except Exception:
 # ----------------------------
 # Config
 # ----------------------------
-st.set_page_config(page_title="Frame Similarity (Upload or YouTube)", layout="wide")
+st.set_page_config(page_title="Frame Similarity (Uploads + YouTube)", layout="wide")
 
 LBP_P = 16
 LBP_R = 2
 LBP_METHOD = "uniform"
+
 
 # ----------------------------
 # Labeling helpers (Option 3: hover-only metadata)
@@ -74,20 +76,21 @@ def build_hover_tooltip(
     cluster_id: Optional[int] = None,
     clip_sim: Optional[float] = None,
 ) -> str:
-    parts = []
-    parts.append(f"Frame ID: {r.frame_id}")
-    parts.append(f"Exact time: {r.t_sec:.6f} seconds")
-    parts.append(f"Frame index: {r.frame_index}")
-    parts.append(f"Entropy: {r.entropy:.6f}")
-    parts.append(f"Edge density: {r.edge:.6f}")
-    parts.append(f"Brightness: {r.brightness:.2f}")
+    parts = [
+        f"Frame ID: {r.frame_id}",
+        f"Exact time: {r.t_sec:.6f} seconds",
+        f"Frame index: {r.frame_index}",
+        f"Entropy: {r.entropy:.6f}",
+        f"Edge density: {r.edge:.6f}",
+        f"Brightness: {r.brightness:.2f}",
+    ]
     if similarity_score is not None:
         parts.append(f"Similarity score: {float(similarity_score):.6f}")
     if clip_sim is not None:
         parts.append(f"CLIP similarity: {float(clip_sim):.6f}")
     if cluster_id is not None:
         parts.append(f"Cluster: {int(cluster_id)}")
-    parts.append(f"Source file: {r.video_name}")
+    parts.append(f"Source: {r.video_name}")
     return "\n".join(parts)
 
 def render_frame_label(
@@ -117,6 +120,7 @@ def render_frame_label(
         """,
         unsafe_allow_html=True,
     )
+
 
 # ----------------------------
 # Image + descriptor helpers
@@ -197,7 +201,6 @@ class FrameRecord:
     frame_index: int
     thumb_path: str
 
-    # descriptors
     gray_small: np.ndarray
     color_hist: np.ndarray
     hue_hist: np.ndarray
@@ -206,7 +209,6 @@ class FrameRecord:
     texture_hist: np.ndarray
     brightness: float
 
-    # CLIP embedding (optional)
     clip_emb: Optional[np.ndarray] = None
 
 
@@ -219,7 +221,6 @@ def compute_pair_similarity(
     weights: Dict[str, float],
     use_clip: bool,
 ) -> Tuple[float, Dict[str, float]]:
-    # Structural alignment: SSIM on small grayscale
     try:
         s = float(ssim(A.gray_small, B.gray_small, data_range=255))
         s = max(-1.0, min(1.0, s))
@@ -250,11 +251,8 @@ def compute_pair_similarity(
         "hue_distribution": hue_sim,
     }
 
-    # CLIP similarity (cosine -> [0,1])
-    clip_sim = None
     if use_clip and (A.clip_emb is not None) and (B.clip_emb is not None):
-        # embeddings are normalized; dot gives cosine in [-1,1] but should be [-1,1] (typically [0,1])
-        c = float(np.dot(A.clip_emb, B.clip_emb))
+        c = float(np.dot(A.clip_emb, B.clip_emb))  # embeddings are normalized
         c = max(-1.0, min(1.0, c))
         clip_sim = (c + 1.0) / 2.0
         comps["clip_similarity"] = clip_sim
@@ -304,7 +302,6 @@ def extract_frames(
         if frame_idx % step == 0:
             t_sec = frame_idx / fps
 
-            # thumbnail
             thumb = _resize_keep_aspect(frame, thumb_max_side)
             thumb_rgb = cv2.cvtColor(thumb, cv2.COLOR_BGR2RGB)
             thumb_img = Image.fromarray(thumb_rgb)
@@ -313,27 +310,28 @@ def extract_frames(
             thumb_path = os.path.join(thumbs_dir, f"{frame_id}.jpg")
             thumb_img.save(thumb_path, quality=90)
 
-            # analysis frame
             analysis_bgr = _resize_keep_aspect(frame, analysis_max_side)
             gray = _to_gray(analysis_bgr).astype(np.uint8)
 
-            rec = FrameRecord(
-                frame_id=frame_id,
-                video_name=video_name,
-                video_index=video_index,
-                t_sec=float(t_sec),
-                frame_index=int(frame_idx),
-                thumb_path=thumb_path,
-                gray_small=gray,
-                color_hist=color_hist_bgr(analysis_bgr, bins=32),
-                hue_hist=hue_hist(analysis_bgr, bins=36),
-                entropy=shannon_entropy_gray(gray),
-                edge=edge_density(gray),
-                texture_hist=lbp_hist(gray),
-                brightness=brightness_mean(gray),
-                clip_emb=None,
+            frames.append(
+                FrameRecord(
+                    frame_id=frame_id,
+                    video_name=video_name,
+                    video_index=video_index,
+                    t_sec=float(t_sec),
+                    frame_index=int(frame_idx),
+                    thumb_path=thumb_path,
+                    gray_small=gray,
+                    color_hist=color_hist_bgr(analysis_bgr, bins=32),
+                    hue_hist=hue_hist(analysis_bgr, bins=36),
+                    entropy=shannon_entropy_gray(gray),
+                    edge=edge_density(gray),
+                    texture_hist=lbp_hist(gray),
+                    brightness=brightness_mean(gray),
+                    clip_emb=None,
+                )
             )
-            frames.append(rec)
+
             grabbed += 1
             if grabbed >= max_frames:
                 break
@@ -347,14 +345,15 @@ def extract_frames(
 
 
 # ----------------------------
-# Input handling: Upload and YouTube
+# Input handling (Uploads + YouTube in same session)
 # ----------------------------
-def _sha1_text(s: str) -> str:
-    return hashlib.sha1(s.encode("utf-8")).hexdigest()
+def _sha1_bytes(bts: bytes) -> str:
+    return hashlib.sha1(bts).hexdigest()
 
 def ensure_upload_tempfile(upload) -> str:
     """Persist upload to a temp file path that survives reruns via session_state."""
-    key = f"upload_path::{upload.name}::{hashlib.sha1(upload.getbuffer()).hexdigest()}"
+    bts = upload.getbuffer().tobytes()
+    key = f"{upload.name}::{_sha1_bytes(bts)}"
     if "upload_paths" not in st.session_state:
         st.session_state.upload_paths = {}
     if key in st.session_state.upload_paths and os.path.exists(st.session_state.upload_paths[key]):
@@ -364,18 +363,17 @@ def ensure_upload_tempfile(upload) -> str:
     fd, path = tempfile.mkstemp(suffix=suffix, prefix="upload_")
     os.close(fd)
     with open(path, "wb") as f:
-        f.write(upload.getbuffer())
+        f.write(bts)
     st.session_state.upload_paths[key] = path
     return path
 
 def download_youtube(url: str, max_height: int) -> Tuple[str, str]:
     """
-    Downloads a YouTube URL to a local mp4 path (best-effort).
-    Returns (filepath, display_name).
-    Uses a progressive MP4 format preference to reduce ffmpeg dependency.
+    Downloads YouTube URL to local path (best-effort).
+    Prefers progressive mp4 to reduce ffmpeg dependency.
     """
     if not YTDLP_OK:
-        raise RuntimeError("yt-dlp is not installed. Add `yt-dlp` to requirements.")
+        raise RuntimeError("yt-dlp is not installed. Add `yt-dlp` to requirements.txt")
 
     if "yt_cache" not in st.session_state:
         st.session_state.yt_cache = {}
@@ -389,7 +387,6 @@ def download_youtube(url: str, max_height: int) -> Tuple[str, str]:
     out_dir = tempfile.mkdtemp(prefix="yt_")
     outtmpl = os.path.join(out_dir, "%(title).80s_%(id)s.%(ext)s")
 
-    # Prefer progressive mp4 to avoid needing merge/ffmpeg. Fall back to best.
     fmt = f"best[ext=mp4][height<={max_height}]/best[ext=mp4]/best"
 
     ydl_opts = {
@@ -403,13 +400,9 @@ def download_youtube(url: str, max_height: int) -> Tuple[str, str]:
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
-
-        # Derive actual filename
         path = ydl.prepare_filename(info)
-
-        # Some downloads end up as .webm or other; we still try to read via OpenCV.
         title = info.get("title") or "YouTube video"
-        vid = info.get("id") or _sha1_text(url)[:8]
+        vid = info.get("id") or hashlib.sha1(url.encode("utf-8")).hexdigest()[:8]
         display_name = f"{title} ({vid})"
 
     st.session_state.yt_cache[cache_key] = (path, display_name)
@@ -417,7 +410,7 @@ def download_youtube(url: str, max_height: int) -> Tuple[str, str]:
 
 
 # ----------------------------
-# Caching key (for extraction/compute)
+# Cache key for extraction
 # ----------------------------
 def build_cache_key(
     sources: List[Tuple[str, str]],
@@ -427,10 +420,6 @@ def build_cache_key(
     thumb_max_side: int,
     analysis_max_side: int,
 ) -> str:
-    """
-    sources: list of (path, display_name)
-    Cache key uses file metadata to avoid hashing large files.
-    """
     h = hashlib.sha256()
     h.update(mode.encode("utf-8"))
     h.update(str(interval_value).encode("utf-8"))
@@ -451,7 +440,7 @@ def build_cache_key(
 
 
 # ----------------------------
-# CLIP embedding computation
+# CLIP
 # ----------------------------
 def _clip_device() -> str:
     if not CLIP_OK:
@@ -464,32 +453,22 @@ def _clip_device() -> str:
 
 @st.cache_resource(show_spinner=False)
 def load_clip_model(model_name: str = "ViT-B-32", pretrained: str = "laion2b_s34b_b79k"):
-    """
-    Cached model load.
-    """
     if not CLIP_OK:
-        return None, None, None, None
+        return None, None, None
     device = _clip_device()
     model, _, preprocess = open_clip.create_model_and_transforms(model_name, pretrained=pretrained)
-    tokenizer = open_clip.get_tokenizer(model_name)
     model = model.to(device)
     model.eval()
-    return model, preprocess, tokenizer, device
+    return model, preprocess, device
 
-def compute_clip_embeddings_for_records(records: List[FrameRecord], clip_image_side: int = 224) -> None:
-    """
-    Fills r.clip_emb with L2-normalized embeddings (numpy float32).
-    Uses thumbnails as input (fast) but you can switch to analysis frames if you prefer.
-    """
-    model, preprocess, _, device = load_clip_model()
+def compute_clip_embeddings_for_records(records: List[FrameRecord]) -> None:
+    model, preprocess, device = load_clip_model()
     if model is None:
         return
 
-    # Cache embeddings in session to avoid recompute across reruns
     if "clip_emb_cache" not in st.session_state:
         st.session_state.clip_emb_cache = {}
 
-    # Batch computation
     batch = []
     batch_recs = []
 
@@ -507,24 +486,20 @@ def compute_clip_embeddings_for_records(records: List[FrameRecord], clip_image_s
         batch.clear()
         batch_recs.clear()
 
-    # Reasonable batch sizes; adjust if GPU
     bs = 32 if device in ("cuda", "mps") else 16
 
     for r in records:
         if r.frame_id in st.session_state.clip_emb_cache:
             r.clip_emb = st.session_state.clip_emb_cache[r.frame_id]
             continue
-
         try:
             pil = Image.open(r.thumb_path).convert("RGB")
-            # Ensure preprocess sees expected size; preprocess will handle resize/crop
             img_t = preprocess(pil)
             batch.append(img_t)
             batch_recs.append(r)
             if len(batch) >= bs:
                 flush()
         except Exception:
-            # leave clip_emb None
             r.clip_emb = None
 
     flush()
@@ -562,52 +537,85 @@ def cluster_frames(records: List[FrameRecord], distance_threshold: float) -> np.
 # ----------------------------
 # UI
 # ----------------------------
-st.title("Frame Similarity Analyzer (Upload or YouTube)")
+st.title("Frame Similarity Analyzer (Uploads + YouTube)")
 
 with st.sidebar:
-    st.header("1) Choose input source")
-    input_mode = st.radio("Source", ["Upload file(s)", "YouTube URL(s)"], index=0)
+    st.header("1) Add videos (mix & match)")
 
-    sources: List[Tuple[str, str]] = []  # list of (path, display_name)
+    # Uploads
+    uploads = st.file_uploader(
+        "Upload video file(s)",
+        type=["mp4", "mov", "m4v", "avi", "mkv", "webm"],
+        accept_multiple_files=True,
+    )
 
-    if input_mode == "Upload file(s)":
-        uploads = st.file_uploader(
-            "Upload video(s). One video is fine; multiple enables cross-video comparisons.",
-            type=["mp4", "mov", "m4v", "avi", "mkv", "webm"],
-            accept_multiple_files=True,
-        )
-        if uploads:
-            for u in uploads:
-                p = ensure_upload_tempfile(u)
-                sources.append((p, u.name))
+    # YouTube
+    st.subheader("YouTube URLs (optional)")
+    if not YTDLP_OK:
+        st.info("To enable URL downloads, add `yt-dlp` to requirements.txt.")
+    yt_urls_text = st.text_area(
+        "Paste YouTube URL(s) (one per line).",
+        placeholder="https://www.youtube.com/watch?v=...\nhttps://youtu.be/...",
+        height=110,
+    )
+    max_height = st.selectbox("Max download resolution", [360, 480, 720, 1080], index=2)
+    force_redownload = st.checkbox("Force re-download (ignore URL cache)", value=False)
+    if force_redownload and "yt_cache" in st.session_state:
+        st.session_state.yt_cache = {}
 
-    else:
-        if not YTDLP_OK:
-            st.warning("YouTube mode requires `yt-dlp` in requirements.txt.")
-        yt_urls_text = st.text_area(
-            "Paste 1–3 YouTube URLs (one per line).",
-            placeholder="https://www.youtube.com/watch?v=...\nhttps://youtu.be/...",
-            height=120,
-        )
-        max_height = st.selectbox("Max download resolution", [360, 480, 720, 1080], index=2)
-        force_redownload = st.checkbox("Force re-download (ignore cache)", value=False)
+    add_urls = st.button("Add/Download URL video(s)")
 
-        if force_redownload and "yt_cache" in st.session_state:
-            st.session_state.yt_cache = {}
+    # Build sources list from session + current uploads
+    if "sources" not in st.session_state:
+        st.session_state.sources = []  # list of dicts: {"path":..., "name":..., "kind":..., "key":...}
 
+    # Add uploads immediately on each rerun
+    if uploads:
+        for u in uploads:
+            path = ensure_upload_tempfile(u)
+            key = f"upload::{u.name}::{os.path.basename(path)}"
+            # dedupe
+            if not any(s.get("key") == key for s in st.session_state.sources):
+                st.session_state.sources.append({"path": path, "name": u.name, "kind": "upload", "key": key})
+
+    # Add URL downloads only when button pressed (avoids re-downloading every rerun)
+    if add_urls:
         urls = [u.strip() for u in yt_urls_text.splitlines() if u.strip()]
-        if urls and YTDLP_OK:
-            if len(urls) > 3:
-                st.warning("For stability, this UI limits to 3 URLs. Only the first 3 will be used.")
-                urls = urls[:3]
-            if st.button("Download YouTube video(s)"):
-                for url in urls:
-                    try:
-                        with st.spinner(f"Downloading: {url}"):
-                            p, name = download_youtube(url, max_height=max_height)
-                        sources.append((p, name))
-                    except Exception as e:
-                        st.error(f"Failed to download URL: {url}\n\n{e}")
+        if not urls:
+            st.warning("Paste at least one YouTube URL.")
+        elif not YTDLP_OK:
+            st.error("yt-dlp is not installed; URL mode is disabled.")
+        else:
+            if len(urls) > 10:
+                st.warning("For stability, limiting to the first 10 URLs.")
+                urls = urls[:10]
+            for url in urls:
+                try:
+                    with st.spinner(f"Downloading: {url}"):
+                        path, name = download_youtube(url, max_height=max_height)
+                    key = f"yt::{url}::h{max_height}"
+                    if not any(s.get("key") == key for s in st.session_state.sources):
+                        st.session_state.sources.append({"path": path, "name": name, "kind": "youtube", "key": key})
+                except Exception as e:
+                    st.error(f"Failed to download:\n{url}\n\n{e}")
+
+    # Show current sources + allow removal
+    st.subheader("Current session videos")
+    if not st.session_state.sources:
+        st.caption("No videos added yet.")
+    else:
+        remove_indices = []
+        for idx, ssrc in enumerate(st.session_state.sources):
+            cols = st.columns([0.78, 0.22])
+            with cols[0]:
+                st.caption(f"{idx+1}. {ssrc['name']}")
+            with cols[1]:
+                if st.button("Remove", key=f"rm_{idx}"):
+                    remove_indices.append(idx)
+        if remove_indices:
+            for idx in sorted(remove_indices, reverse=True):
+                st.session_state.sources.pop(idx)
+            st.rerun()
 
     st.header("2) Frame sampling")
     mode = st.radio("Sampling mode", ["Every N seconds", "Every N frames"], index=0)
@@ -622,8 +630,7 @@ with st.sidebar:
     analysis_max_side = st.slider("Analysis max side (px)", min_value=120, max_value=720, value=320, step=20)
 
     st.header("4) Similarity metrics")
-    st.caption("Weights control how each metric contributes to the combined similarity score.")
-
+    st.caption("Weights control each metric’s contribution to the final score.")
     weights: Dict[str, float] = {
         "structural_alignment": st.slider("Structural alignment (SSIM)", 0.0, 3.0, 0.8, 0.1),
         "color_histogram": st.slider("Color histogram", 0.0, 3.0, 1.2, 0.1),
@@ -644,16 +651,17 @@ with st.sidebar:
             weights["clip_similarity"] = st.slider("CLIP similarity weight", 0.0, 6.0, 3.0, 0.1)
 
     st.header("5) Retrieval")
-    top_k = st.slider("Top-K matches to show", min_value=3, max_value=50, value=12, step=1)
+    top_k = st.slider("Top-K matches", min_value=3, max_value=50, value=12, step=1)
 
 
-# Gate: need at least one source
+# Build sources list (path, display_name) from session_state
+sources: List[Tuple[str, str]] = [(s["path"], s["name"]) for s in st.session_state.get("sources", [])]
+
 if not sources:
-    st.info("Add at least one video (upload a file, or download from YouTube) to begin.")
+    st.info("Add at least one video (upload and/or YouTube URL) to begin.")
     st.stop()
 
-# Sort sources by name for stability (optional)
-sources = list(sources)
+multi_video = len(sources) > 1
 
 # Extraction cache key
 cache_key = build_cache_key(
@@ -665,10 +673,10 @@ cache_key = build_cache_key(
     analysis_max_side=int(analysis_max_side),
 )
 
+# Extract (cached in session)
 if "cache_key" not in st.session_state or st.session_state.cache_key != cache_key:
     thumbs_dir = tempfile.mkdtemp(prefix="thumbs_")
     all_records: List[FrameRecord] = []
-
     with st.spinner("Extracting frames and computing descriptors..."):
         for i, (path, name) in enumerate(sources):
             recs = extract_frames(
@@ -683,20 +691,19 @@ if "cache_key" not in st.session_state or st.session_state.cache_key != cache_ke
                 thumbs_dir=thumbs_dir,
             )
             all_records.extend(recs)
-
     st.session_state.cache_key = cache_key
     st.session_state.records = all_records
     st.session_state.thumbs_dir = thumbs_dir
-    st.session_state.cluster_labels = None  # reset clustering when extraction changes
+    st.session_state.cluster_labels = None
 else:
     all_records = st.session_state.records
     thumbs_dir = st.session_state.thumbs_dir
 
 if not all_records:
-    st.error("No frames were extracted. Try a smaller interval or higher max-frames-per-video.")
+    st.error("No frames were extracted. Try a smaller interval or a higher max-frames-per-video.")
     st.stop()
 
-# Optional: compute CLIP embeddings
+# Optional: CLIP embeddings
 if enable_clip and CLIP_OK:
     with st.spinner("Computing CLIP embeddings for extracted frames..."):
         compute_clip_embeddings_for_records(all_records)
@@ -720,13 +727,12 @@ df = pd.DataFrame(
     ]
 )
 
-multi_video = len(sources) > 1
-
-# If clustering exists, map frame_id -> cluster label
+# cluster map
 cluster_map = None
 if st.session_state.get("cluster_labels") is not None:
     labels = st.session_state.cluster_labels
     cluster_map = {all_records[i].frame_id: int(labels[i]) for i in range(len(all_records))}
+
 
 # ---------------------------------
 # Extracted frames browser
@@ -736,7 +742,6 @@ st.subheader("Extracted frames")
 c1, c2, c3 = st.columns([1.25, 1.0, 2.75])
 
 with c1:
-    # Filter by video display name
     video_filter = st.multiselect(
         "Filter by source video",
         options=sorted(df["video"].unique().tolist()),
@@ -749,12 +754,8 @@ with c2:
     st.metric("Frames (filtered)", len(df_f))
 
 with c3:
-    if multi_video:
-        st.caption("You have multiple videos loaded. Similarity search can span all videos or stay within one.")
-    else:
-        st.caption("Single-video mode: similarity search runs within the one uploaded/downloaded video.")
+    st.caption("Pick a query frame below and retrieve visually resonant matches (within one video or across all).")
 
-# thumbnail grid (limited)
 max_grid = 60
 grid_df = df_f.head(max_grid)
 
@@ -793,7 +794,6 @@ with left:
     render_frame_label(query, cluster_id=cid)
 
     exclude_same_frame = st.checkbox("Exclude the exact same frame from results", value=True)
-
     if scope == "All videos":
         exclude_same_video = st.checkbox("Exclude frames from the same video", value=False)
     else:
@@ -804,12 +804,8 @@ with right:
     for r in all_records:
         if exclude_same_frame and r.frame_id == query.frame_id:
             continue
-
-        # Scope enforcement
         if scope == "This video only" and r.video_index != query.video_index:
             continue
-
-        # Optional exclude-same-video when searching all videos
         if scope == "All videos" and exclude_same_video and r.video_index == query.video_index:
             continue
 
@@ -875,10 +871,7 @@ st.subheader("Scene clustering (optional)")
 if not SKLEARN_OK:
     st.info("Clustering disabled (missing scikit-learn). Add `scikit-learn` to requirements.txt to enable.")
 else:
-    st.caption(
-        "Clusters frames into visually similar groups. In multi-video mode, clusters can include frames from different videos."
-    )
-
+    st.caption("Clusters frames into visually similar groups (can span videos in multi-video mode).")
     cluster_threshold = st.slider(
         "Cluster sensitivity (lower = more clusters, higher = fewer clusters)",
         min_value=1.0,
@@ -910,16 +903,14 @@ else:
 st.divider()
 
 # ---------------------------------
-# Cross-video similarity matrix (only when multi-video)
+# Cross-video similarity matrix (optional)
 # ---------------------------------
 st.subheader("Cross-video similarity matrix (optional)")
 
 if not multi_video:
-    st.info("Upload/download 2+ videos to enable cross-video similarity matrix.")
+    st.info("Add 2+ videos to enable the cross-video similarity matrix.")
 else:
-    st.caption(
-        "Rough video-to-video similarity: for each frame in Video A, take its best match in Video B, then average."
-    )
+    st.caption("For each frame in Video A, take its best match in Video B, then average.")
     do_matrix = st.checkbox("Compute cross-video similarity matrix", value=False)
     if do_matrix:
         with st.spinner("Computing matrix... (can be slow)"):
@@ -938,7 +929,6 @@ else:
                         mat[i, j] = 1.0
                         continue
                     B = by_video[vb]
-
                     bests = []
                     for a in A:
                         best = 0.0
@@ -958,13 +948,13 @@ else:
 with st.expander("Metric definitions (what the app is computing)"):
     st.markdown(
         """
-- **Structural alignment (SSIM):** similarity of grayscale structure after resizing (best for near-duplicates).
-- **Color histogram:** correlation between normalized per-channel color histograms (palette similarity).
-- **Hue distribution:** correlation between hue histograms in HSV space (palette similarity, hue-focused).
-- **Entropy similarity:** compares Shannon entropy of grayscale (overall complexity).
-- **Edge complexity:** compares edge density from Canny edges (structural complexity).
-- **Texture correlation (LBP):** compares texture histograms (material/surface similarity).
-- **Brightness similarity:** compares mean grayscale brightness (tonal similarity).
-- **CLIP similarity (optional):** semantic + compositional resonance via vision-language pretraining (best for “visual resonance” across different footage).
+- **Structural alignment (SSIM):** grayscale structural similarity (best for near-duplicates).
+- **Color histogram:** palette similarity via RGB distributions.
+- **Hue distribution:** palette similarity via HSV hue distributions.
+- **Entropy similarity:** global image complexity similarity.
+- **Edge complexity:** edge-density similarity (structural complexity).
+- **Texture correlation (LBP):** texture/material similarity.
+- **Brightness similarity:** tonal similarity via mean luminance.
+- **CLIP similarity (optional):** semantic + compositional resonance (best for “visual resonance” across different footage).
         """
     )
